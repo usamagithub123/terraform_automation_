@@ -1,0 +1,108 @@
+name: Terraform Plan
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Terraform action"
+        required: true
+        default: "plan"
+        type: choice
+        options:
+          - plan
+          - apply
+          - destroy
+
+      instance_type:
+        description: "EC2 instance type"
+        required: true
+        default: "t3.medium"
+
+      windows_instance_count:
+        description: "Number of Windows machines"
+        required: true
+        default: "2"
+
+      admin_cidr:
+        description: "Admin CIDR for RDP access"
+        required: true
+
+      ritm_sys_id:
+        description: "ServiceNow RITM sys_id"
+        required: false
+
+      ritm_number:
+        description: "ServiceNow RITM number"
+        required: false
+
+jobs:
+  terraform-plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+
+    env:
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      TF_VAR_aws_region: ${{ secrets.AWS_REGION }}
+      TF_VAR_key_name: ${{ secrets.KEY_NAME }}
+      TF_VAR_admin_cidr: ${{ github.event.inputs.admin_cidr }}
+      TF_VAR_instance_type: ${{ github.event.inputs.instance_type }}
+      TF_VAR_windows_instance_count: ${{ github.event.inputs.windows_instance_count }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials using access key
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Terraform Format Check
+        run: terraform fmt -check
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Terraform Plan
+        id: tfplan
+        run: |
+          terraform plan -no-color
+
+      - name: Update ServiceNow RITM
+        if: always() && github.event.inputs.ritm_sys_id != ''
+        env:
+          SN_INSTANCE_URL: ${{ secrets.SN_INSTANCE_URL }}
+          SN_USERNAME: ${{ secrets.SN_USERNAME }}
+          SN_PASSWORD: ${{ secrets.SN_PASSWORD }}
+          RITM_SYS_ID: ${{ github.event.inputs.ritm_sys_id }}
+          RITM_NUMBER: ${{ github.event.inputs.ritm_number }}
+          PLAN_STATUS: ${{ steps.tfplan.outcome }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ "$PLAN_STATUS" = "success" ]; then
+            NOTES="Terraform Plan completed successfully for ${RITM_NUMBER}. GitHub Actions Run: ${RUN_URL}"
+            STATE="3"
+            STAGE="delivery"
+          else
+            NOTES="Terraform Plan failed for ${RITM_NUMBER}. Please check GitHub Actions Run: ${RUN_URL}"
+            STATE="4"
+            STAGE="delivery"
+          fi
+
+          curl -sS -X PATCH "${SN_INSTANCE_URL}/api/now/table/sc_req_item/${RITM_SYS_ID}" \
+            -u "${SN_USERNAME}:${SN_PASSWORD}" \
+            -H "Content-Type: application/json" \
+            -H "Accept: application/json" \
+            --data "$(jq -n \
+              --arg notes "$NOTES" \
+              --arg stage "$STAGE" \
+              --arg state "$STATE" \
+              '{work_notes: $notes, stage: $stage, state: $state}')"
